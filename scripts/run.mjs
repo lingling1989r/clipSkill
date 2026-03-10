@@ -36,9 +36,10 @@
  *   CLIP_SKILL_LANGUAGE       Defaults to zh
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { existsSync, readFileSync, createWriteStream } from 'node:fs';
 import { basename, resolve, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -112,6 +113,8 @@ function printSessions() {
 function parseArgs(argv) {
   const args = {
     file: null,
+    url: null,        // download from HTTP URL (e.g. Feishu file link)
+    urlToken: null,   // Bearer token for authenticated URLs (e.g. Feishu access token)
     audioId: null,    // operate on existing audio, skip upload
     last: false,      // use last session's audioId
     list: false,      // print sessions and exit
@@ -125,6 +128,8 @@ function parseArgs(argv) {
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if      (a === '--file')        args.file        = argv[++i];
+    else if (a === '--url')         args.url         = argv[++i];
+    else if (a === '--url-token')   args.urlToken    = argv[++i];
     else if (a === '--audio-id')    args.audioId     = argv[++i];
     else if (a === '--last')        args.last        = true;
     else if (a === '--list')        args.list        = true;
@@ -197,6 +202,49 @@ async function uploadFile({ backendUrl, token, filePath }) {
   const audioId = json?.audio?.id;
   if (!audioId) throw new Error('upload succeeded but audioId missing in response');
   return { audioId, audio: json.audio };
+}
+
+// ── URL download (for large files e.g. Feishu) ───────────────────────────────
+
+async function downloadFromUrl(url, { token } = {}) {
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status} ${url}`);
+
+  // Derive filename from Content-Disposition header or URL path
+  const cd             = res.headers.get('content-disposition') || '';
+  const nameFromHeader = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i)?.[1]?.trim();
+  const nameFromUrl    = decodeURIComponent(url.split('?')[0].split('/').pop() || '');
+  const fileName       = nameFromHeader || nameFromUrl || `audio-${Date.now()}.mp3`;
+
+  const totalBytes = parseInt(res.headers.get('content-length') || '0', 10);
+  const tmpPath    = resolve(tmpdir(), `clipskill-${Date.now()}-${fileName}`);
+  const fileStream = createWriteStream(tmpPath);
+
+  let downloaded = 0;
+  process.stdout.write(`[clip-skill] downloading ${fileName}`);
+  if (totalBytes > 0) process.stdout.write(` (${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
+  process.stdout.write('\n');
+
+  // Stream response body chunk-by-chunk into temp file (no full-memory load)
+  const reader = res.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await new Promise((ok, fail) => fileStream.write(value, e => e ? fail(e) : ok()));
+    downloaded += value.length;
+    if (totalBytes > 0) {
+      const pct = Math.round(downloaded / totalBytes * 100);
+      const mb  = (downloaded / 1024 / 1024).toFixed(1);
+      process.stdout.write(`\r[clip-skill] downloading... ${pct}% (${mb}MB)   `);
+    } else {
+      process.stdout.write('.');
+    }
+  }
+  await new Promise((ok, fail) => fileStream.end(e => e ? fail(e) : ok()));
+  process.stdout.write('\r[clip-skill] download complete                          \n');
+
+  return { localPath: tmpPath, fileName };
 }
 
 async function waitJob({ name, poll, isDone, intervalMs = 2000, timeoutMs = 10 * 60 * 1000 }) {
@@ -393,7 +441,9 @@ async function main() {
     console.log('Usage: node scripts/run.mjs [source] [options]');
     console.log('');
     console.log('Source (pick one):');
-    console.log('  --file <path>             Upload a new audio/video file');
+    console.log('  --file <path>             Upload a new audio/video file (local path)');
+    console.log('  --url <url>               Download from URL then upload (e.g. Feishu file link)');
+    console.log('  --url-token <token>       Bearer token for authenticated URLs (e.g. Feishu access token)');
     console.log('  --audio-id <id>           Operate on an already-uploaded audio (no re-upload)');
     console.log('  --last                    Use the last uploaded audio automatically');
     console.log('  --list                    List recent sessions and exit');
@@ -407,7 +457,9 @@ async function main() {
     console.log('');
     console.log('Examples:');
     console.log('  node scripts/run.mjs --file podcast.mp3');
-    console.log('  node scripts/run.mjs --last --instruction "把口头禅也去掉"');
+    console.log('  node scripts/run.mjs --url "https://..." --instruction "把口头禅去掉"');
+    console.log('  node scripts/run.mjs --url "https://..." --url-token <feishu_token>');
+    console.log('  node scripts/run.mjs --last --instruction "再把金句也提一下"');
     console.log('  node scripts/run.mjs --audio-id abc-123 --mode quote');
     console.log('  node scripts/run.mjs --last --start 600 --end 1080');
     console.log('  node scripts/run.mjs --list');
@@ -444,10 +496,12 @@ async function main() {
     skipUpload = true;
     console.log(`[clip-skill] using existing audio: ${audioId}`);
 
+  } else if (args.url) {
+    // URL download path — handled below in upload section
   } else if (args.file) {
     // normal upload path
   } else {
-    console.error('[clip-skill] ERROR: specify --file, --audio-id, --last, or --list.');
+    console.error('[clip-skill] ERROR: specify --file, --url, --audio-id, --last, or --list.');
     console.error('             Run with --help for usage.');
     process.exit(1);
   }
@@ -458,15 +512,30 @@ async function main() {
   // ── Upload (if needed) ───────────────────────────────────────────────────
 
   if (!skipUpload) {
-    console.log('[clip-skill] uploading:', args.file);
-    const { audioId: newId, audio } = await uploadFile({ backendUrl, token, filePath: args.file });
+    let localPath   = args.file;
+    let tmpToClean  = null;
+    let displayName = args.file ? basename(args.file) : null;
+
+    if (args.url) {
+      console.log('[clip-skill] fetching from URL:', args.url);
+      const { localPath: dl, fileName } = await downloadFromUrl(args.url, { token: args.urlToken });
+      localPath   = dl;
+      tmpToClean  = dl;
+      displayName = fileName;
+    }
+
+    console.log('[clip-skill] uploading:', displayName || localPath);
+    const { audioId: newId, audio } = await uploadFile({ backendUrl, token, filePath: localPath });
     audioId = newId;
     console.log('[clip-skill] uploaded → audioId:', audioId);
+
+    // Clean up temp file after upload
+    if (tmpToClean) await unlink(tmpToClean).catch(() => {});
 
     // Persist session
     await saveSession({
       audioId,
-      originalName: audio?.originalName || basename(args.file),
+      originalName: audio?.originalName || displayName || basename(localPath),
       duration:     audio?.duration     || null,
       uploadedAt:   new Date().toISOString(),
     });
