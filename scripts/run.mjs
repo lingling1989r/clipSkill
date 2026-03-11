@@ -209,7 +209,19 @@ async function uploadFile({ backendUrl, token, filePath }) {
 async function downloadFromUrl(url, { token } = {}) {
   const headers = token ? { Authorization: `Bearer ${token}` } : {};
   const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error(`download failed: HTTP ${res.status} ${url}`);
+
+  // Detect Feishu file-too-large error (and other JSON error responses) before streaming
+  const contentType = res.headers.get('content-type') || '';
+  if (!res.ok || contentType.includes('application/json')) {
+    const json = await res.json().catch(() => null);
+    if (json?.code === 234037) {
+      const err = new Error('文件超出飞书下载限制（>30MB）');
+      err.code = 'FEISHU_FILE_TOO_LARGE';
+      throw err;
+    }
+    if (!res.ok) throw new Error(`download failed: HTTP ${res.status} ${url}`);
+    throw new Error(`download failed: unexpected JSON response from ${url}`);
+  }
 
   // Derive filename from Content-Disposition header or URL path
   const cd             = res.headers.get('content-disposition') || '';
@@ -273,8 +285,45 @@ function printResult({ backendUrl, audioId }) {
   console.log('[clip-skill] 继续编辑: node scripts/run.mjs --audio-id', audioId, '--instruction "..."');
 }
 
-// ── Transcribe ────────────────────────────────────────────────────────────────
+// ── Direct-upload link (large file fallback) ──────────────────────────────────
 
+async function createUploadLink({ backendUrl, token }) {
+  const data = await httpJson(`${backendUrl}/api/direct-upload`, {
+    method: 'POST',
+    token,
+  });
+  return { url: data.url, linkToken: data.token };
+}
+
+async function pollUploadLink({ backendUrl, token, linkToken, intervalMs = 3000, timeoutMs = 30 * 60 * 1000 }) {
+  const start = Date.now();
+  process.stdout.write('[clip-skill] 等待上传完成');
+  while (true) {
+    await sleep(intervalMs);
+    process.stdout.write('.');
+    const data = await httpJson(`${backendUrl}/api/direct-upload/${linkToken}/status`, { token });
+    if (data.status === 'done') {
+      process.stdout.write(' 完成\n');
+      return data.audioId;
+    }
+    if (data.status === 'failed') {
+      process.stdout.write('\n');
+      throw new Error(`上传失败: ${data.error || 'unknown'}`);
+    }
+    if (Date.now() - start > timeoutMs) {
+      process.stdout.write('\n');
+      throw new Error('等待上传超时（30分钟）');
+    }
+  }
+}
+
+async function fetchTranscriptionText({ backendUrl, token, audioId }) {
+  const data = await httpJson(`${backendUrl}/api/editing/transcription/${audioId}`, { token });
+  const segments = data?.transcription?.segments || data?.segments || [];
+  return segments.map(s => s.text || '').join('');
+}
+
+// ── Transcribe ────────────────────────────────────────────────────────────────
 async function ensureTranscription({ backendUrl, token, audioId, language }) {
   // Check if transcription already exists
   const status = await httpJson(
@@ -518,10 +567,38 @@ async function main() {
 
     if (args.url) {
       console.log('[clip-skill] fetching from URL:', args.url);
-      const { localPath: dl, fileName } = await downloadFromUrl(args.url, { token: args.urlToken });
-      localPath   = dl;
-      tmpToClean  = dl;
-      displayName = fileName;
+      try {
+        const { localPath: dl, fileName } = await downloadFromUrl(args.url, { token: args.urlToken });
+        localPath   = dl;
+        tmpToClean  = dl;
+        displayName = fileName;
+      } catch (err) {
+        if (err.code !== 'FEISHU_FILE_TOO_LARGE') throw err;
+
+        // ── Large file fallback: provide a mobile upload link ────────────────
+        const { url: uploadUrl, linkToken } = await createUploadLink({ backendUrl, token });
+        console.log('\n[clip-skill] 文件超出飞书下载限制（>30MB）');
+        console.log('[clip-skill] 👉 请用手机打开以下链接上传文件：');
+        console.log(`    ${uploadUrl}`);
+        const uploadedAudioId = await pollUploadLink({ backendUrl, token, linkToken });
+        audioId = uploadedAudioId;
+
+        await saveSession({
+          audioId,
+          originalName: 'feishu-audio',
+          duration:     null,
+          uploadedAt:   new Date().toISOString(),
+        });
+        console.log('[clip-skill] session saved (use --last or --audio-id', audioId, 'to continue)');
+
+        await ensureTranscription({ backendUrl, token, audioId, language });
+
+        const text = await fetchTranscriptionText({ backendUrl, token, audioId });
+        console.log('\n[clip-skill] 转录内容（前2000字）：');
+        console.log(text.slice(0, 2000));
+        console.log('\n[clip-skill] 请告诉我想怎么处理这段音视频（用 --last --instruction \'...\' 继续）');
+        return;
+      }
     }
 
     console.log('[clip-skill] uploading:', displayName || localPath);
