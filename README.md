@@ -16,7 +16,7 @@
 把前面讲吃饭的那段去掉
 ```
 
-clipSkill 会自动把音频上传、转录成文字、找到对应片段、剪掉它，然后告诉你结果在哪里听。
+clipSkill 会先把音视频上传、转录并预处理出删减或金句候选，然后给你一个 PodAha 确认工作台链接。你在网页里确认后，再继续生成最终结果。
 
 ---
 
@@ -141,20 +141,22 @@ node scripts/smoke.mjs
 
 看到 `All checks passed ✓` 就可以用了。
 
-### 第四步：开剪
+### 第四步：进入确认工作台
 
 ```bash
 node scripts/run.mjs --file 你的访谈.mp3
 ```
 
-完成后会输出：
+完成预处理后会输出：
 
 ```
-[clip-skill] ✓ DONE
-[clip-skill] view on platform: https://podaha.com/audio/xxx
+[clip-skill] ✓ READY FOR CONFIRMATION
+[clip-skill] audioId: xxx
+[clip-skill] 确认工作台: https://podaha.com/editor?audioId=xxx&source=clipskill&intent=clip
+[clip-skill] 我的素材: https://podaha.com/audios
 ```
 
-打开链接，结果在里面。
+打开确认工作台，在网页里检查待删片段或 AI 金句，确认后再生成最终结果。
 
 ---
 
@@ -169,7 +171,7 @@ node scripts/run.mjs --file 你的访谈.mp3
 
 ## 结果在哪里看
 
-处理完成后，登录 [podaha.com](https://podaha.com) 即可看到所有剪辑结果，支持：
+预处理完成后，先打开 PodAha 确认工作台完成删减或金句确认。之后登录 [podaha.com](https://podaha.com) 的“我的素材”，即可看到所有结果，支持：
 
 - 在线收听
 - 下载成品音频

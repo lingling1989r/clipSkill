@@ -4,8 +4,8 @@
  * clip-skill — full pipeline runner with session state
  *
  * Modes:
- *   clip  (default) — Upload, transcribe, detect deletions, apply edits.
- *   quote           — Upload, transcribe, extract gold quotes, create quote audio.
+ *   clip  (default) — Upload, transcribe, pre-detect deletions, then hand off to PodAha editor for confirmation.
+ *   quote           — Upload, transcribe, pre-extract quotes, then hand off to PodAha editor for confirmation.
  *
  * Session state (.session.json) persists audioIds across runs so the bot can
  * do multi-turn editing without re-uploading or re-transcribing.
@@ -33,6 +33,7 @@
  *
  * Optional env:
  *   CLIP_SKILL_BACKEND_URL    Defaults to https://api.podaha.com
+ *   CLIP_SKILL_FRONTEND_URL   Defaults to https://podaha.com
  *   CLIP_SKILL_LANGUAGE       Defaults to zh
  */
 
@@ -277,12 +278,38 @@ async function waitJob({ name, poll, isDone, intervalMs = 2000, timeoutMs = 10 *
   }
 }
 
-function printResult({ backendUrl, audioId }) {
-  const platformBase = backendUrl.includes('localhost') ? backendUrl : 'https://podaha.com';
-  console.log('\n[clip-skill] ✓ DONE');
+function getFrontendBaseUrl(backendUrl) {
+  const configured = (process.env.CLIP_SKILL_FRONTEND_URL || '').trim();
+  if (configured) return configured.replace(/\/$/, '');
+  if (backendUrl.includes('localhost')) {
+    return backendUrl.replace('3001', '3000');
+  }
+  return 'https://podaha.com';
+}
+
+function buildEditorUrl({ frontendUrl, audioId, mode, instruction, start, end }) {
+  const url = new URL('/editor', `${frontendUrl.replace(/\/$/, '')}/`);
+  url.searchParams.set('audioId', audioId);
+  url.searchParams.set('source', 'clipskill');
+  url.searchParams.set('intent', mode);
+  if (instruction) url.searchParams.set('instruction', instruction);
+  if (start != null) url.searchParams.set('start', String(start));
+  if (end != null) url.searchParams.set('end', String(end));
+  return url.toString();
+}
+
+function printConfirmationResult({ backendUrl, audioId, editorUrl, mode }) {
+  const platformBase = getFrontendBaseUrl(backendUrl);
+  console.log('\n[clip-skill] ✓ READY FOR CONFIRMATION');
   console.log('[clip-skill] audioId:', audioId);
-  console.log('[clip-skill] 查看结果:', `${platformBase}/audio/${audioId}`);
-  console.log('[clip-skill] 继续编辑: node scripts/run.mjs --audio-id', audioId, '--instruction "..."');
+  console.log('[clip-skill] 确认工作台:', editorUrl);
+  console.log('[clip-skill] 我的素材:', `${platformBase}/audios`);
+  console.log('[clip-skill] 下一步: 打开确认工作台，在网页里确认删减或金句结果');
+  if (mode === 'quote') {
+    console.log('[clip-skill] 提示: 进入页面后可直接检查 AI 金句、手动补选片段，再生成金句音频');
+  } else {
+    console.log('[clip-skill] 提示: 进入页面后可检查待删片段、微调选择，再应用剪辑');
+  }
 }
 
 // ── Direct-upload link (large file fallback) ──────────────────────────────────
@@ -399,31 +426,16 @@ async function runClip({ backendUrl, token, audioId, instruction, start, end }) 
     }
 
     deletedSegmentIds = deletionStatus?.result?.segmentIds || [];
-    console.log(`[clip-skill] found ${deletedSegmentIds.length} segment(s) to remove`);
+    console.log(`[clip-skill] found ${deletedSegmentIds.length} segment(s) to review`);
   }
 
   if (deletedSegmentIds.length === 0) {
-    console.log('[clip-skill] no segments to delete — skipping apply-edits');
-    return;
+    console.log('[clip-skill] no deletion suggestions found — the editor will open with the transcript ready');
+  } else {
+    console.log('[clip-skill] deletion suggestions are ready in the editor for confirmation');
   }
 
-  console.log('[clip-skill] applying edits...');
-  await httpJson(`${backendUrl}/api/editing/apply-edits`, {
-    method: 'POST',
-    token,
-    body: { audioId, deletedSegmentIds },
-  });
-
-  const applyStatus = await waitJob({
-    name: 'apply-edits',
-    poll: () => httpJson(`${backendUrl}/api/editing/apply-edits/${audioId}/status`, { token }),
-    isDone: (s) => s?.status === 'succeeded' || s?.status === 'failed' || s?.status === 'idle',
-    timeoutMs: 20 * 60 * 1000,
-  });
-
-  if (applyStatus.status === 'failed') {
-    throw new Error(`apply-edits failed: ${applyStatus.error || applyStatus.message || 'unknown'}`);
-  }
+  return { deletedSegmentIds };
 }
 
 // ── Mode: quote ───────────────────────────────────────────────────────────────
@@ -450,8 +462,8 @@ async function runQuote({ backendUrl, token, audioId, instruction }) {
 
   const quotes = quoteStatus?.result?.quotes || [];
   if (quotes.length === 0) {
-    console.log('[clip-skill] no quotes found — nothing to create');
-    return;
+    console.log('[clip-skill] no quotes found — the editor will open with transcript ready for manual selection');
+    return { quotes };
   }
 
   console.log(`[clip-skill] found ${quotes.length} quote(s):`);
@@ -459,24 +471,9 @@ async function runQuote({ backendUrl, token, audioId, instruction }) {
     const dur = ((q.endTime ?? 0) - (q.startTime ?? 0)).toFixed(1);
     console.log(`  [${i + 1}] (${dur}s) ${q.text?.slice(0, 60)}${q.text?.length > 60 ? '…' : ''}`);
   });
+  console.log('[clip-skill] quote suggestions are ready in the editor for confirmation');
 
-  console.log('[clip-skill] creating highlight audio...');
-  await httpJson(`${backendUrl}/api/editing/create-intro`, {
-    method: 'POST',
-    token,
-    body: { audioId, quoteIds: quotes.map(q => q.id) },
-  });
-
-  const introStatus = await waitJob({
-    name: 'create-intro',
-    poll: () => httpJson(`${backendUrl}/api/editing/create-intro/${audioId}/status`, { token }),
-    isDone: (s) => s?.status === 'succeeded' || s?.status === 'failed' || s?.status === 'idle',
-    timeoutMs: 20 * 60 * 1000,
-  });
-
-  if (introStatus.status === 'failed') {
-    throw new Error(`create-intro failed: ${introStatus.error || introStatus.message || 'unknown'}`);
-  }
+  return { quotes };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -593,10 +590,19 @@ async function main() {
 
         await ensureTranscription({ backendUrl, token, audioId, language });
 
+        const frontendUrl = getFrontendBaseUrl(backendUrl);
+        const editorUrl = buildEditorUrl({
+          frontendUrl,
+          audioId,
+          mode,
+          instruction: args.instruction,
+          start: args.start,
+          end: args.end,
+        });
         const text = await fetchTranscriptionText({ backendUrl, token, audioId });
         console.log('\n[clip-skill] 转录内容（前2000字）：');
         console.log(text.slice(0, 2000));
-        console.log('\n[clip-skill] 请告诉我想怎么处理这段音视频（用 --last --instruction \'...\' 继续）');
+        printConfirmationResult({ backendUrl, audioId, editorUrl, mode });
         return;
       }
     }
@@ -631,7 +637,17 @@ async function main() {
     await runClip({ backendUrl, token, audioId, instruction: args.instruction, start: args.start, end: args.end });
   }
 
-  printResult({ backendUrl, audioId });
+  const frontendUrl = getFrontendBaseUrl(backendUrl);
+  const editorUrl = buildEditorUrl({
+    frontendUrl,
+    audioId,
+    mode,
+    instruction: args.instruction,
+    start: args.start,
+    end: args.end,
+  });
+
+  printConfirmationResult({ backendUrl, audioId, editorUrl, mode });
 }
 
 main().catch((err) => {

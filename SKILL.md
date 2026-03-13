@@ -1,9 +1,9 @@
 ---
 name: clip-skill
 description: |
-  用嘴剪音视频。上传音频或视频文件，用自然语言告诉 AI 要剪掉什么，自动完成剪辑并发布到你的 PodAha 账号。
+  用嘴剪音视频。上传音频或视频文件，用自然语言告诉 AI 要剪掉什么，先完成转录和预处理，再返回 PodAha 确认工作台链接给你确认。
 
-  Upload an audio/video file to PodAha, tell the AI what to cut in plain language, and get a clean edited result published to your account.
+  Upload an audio/video file to PodAha, describe what to cut in plain language, and get a PodAha confirmation workspace link after transcription and AI pre-processing.
 
   Requires a Personal Access Token from podaha.com to bind results to your account.
 keywords:
@@ -53,11 +53,11 @@ metadata:
 
 ## 能做什么
 
-用一句话告诉 AI 要怎么剪，它自动找到对应片段、剪掉或提取，结果发布到你的 podaha.com 账号。
+用一句话告诉 AI 要怎么剪，它会先自动完成转录和候选预处理，再把你带到 PodAha 确认工作台里做最后确认。
 
 **支持两种模式：**
-- `clip`（默认）：删除不要的片段，保留干净音频
-- `quote`：提取精彩片段，拼成高光音频
+- `clip`（默认）：预检测待删片段，进入工作台确认后应用剪辑
+- `quote`：预提取精彩片段，进入工作台确认后生成高光音频
 
 ---
 
@@ -123,7 +123,7 @@ node scripts/run.mjs --url "https://..." --url-token <飞书access_token>
 
 ## Auth / 账号绑定
 
-每次运行都会把结果绑定到你的 PodAha 账号，在 https://podaha.com 登录后可以：
+每次运行都会把素材和后续结果绑定到你的 PodAha 账号。预处理完成后会先返回确认工作台链接；确认完成后，在 https://podaha.com 登录后可以：
 - 在线收听剪辑结果
 - 下载成品 MP3
 - 查看转录文字
